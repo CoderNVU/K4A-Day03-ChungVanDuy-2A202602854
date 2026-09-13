@@ -6,6 +6,8 @@ Hỗ trợ Native Tool Calling và chuyển đổi linh hoạt qua biến môi t
 import os
 import sys
 import json
+import re
+import time
 from typing import Dict, Any, List
 from dotenv import load_dotenv
 
@@ -36,35 +38,137 @@ class MockOfflineProvider(BaseLLMProvider):
 
     def generate_with_tools(self, prompt: str, tools_schema: List[Dict[str, Any]], system_prompt: str = "") -> Dict[str, Any]:
         prompt_lower = prompt.lower()
-        
-        # Mô phỏng nhận diện intent gọi Tool
-        if "sv2026001" in prompt_lower and "đặt lịch" in prompt_lower:
+
+        student_match = re.search(r"\bSV\d+\b", prompt, re.IGNORECASE)
+        student_id = student_match.group(0).upper() if student_match else ""
+        datetime_match = re.search(
+            r"\b\d{1,2}:\d{2}(?:\s+ngày)?\s+\d{1,2}/\d{1,2}/\d{4}\b",
+            prompt,
+            re.IGNORECASE
+        )
+        datetime_str = (
+            re.sub(r"\s+ngày\s+", " ", datetime_match.group(0), flags=re.IGNORECASE)
+            if datetime_match else "14:00 15/09/2026"
+        )
+
+        observation = None
+        observation_prefix = "Observation gần nhất (JSON): "
+        for line in reversed(prompt.splitlines()):
+            if line.startswith(observation_prefix):
+                try:
+                    observation = json.loads(line[len(observation_prefix):])
+                except json.JSONDecodeError:
+                    observation = {"status": "INVALID_OBSERVATION"}
+                break
+
+        # Tiếp tục suy luận sau khi MCP Server trả về Observation.
+        if observation:
+            if observation.get("status") == "NOT_FOUND":
+                return {
+                    "type": "text",
+                    "content": observation.get("message", "Không tìm thấy thông tin sinh viên yêu cầu."),
+                    "thought": "Công cụ trả về NOT_FOUND nên tôi phản hồi chính xác và không bịa đặt dữ liệu."
+                }
+
+            if "data" in observation:
+                data = observation["data"]
+                if "đặt lịch" in prompt_lower:
+                    return {
+                        "type": "tool_call",
+                        "tool_name": "schedule_appointment",
+                        "arguments": {
+                            "student_id": observation.get("student_id", student_id),
+                            "datetime_str": datetime_str,
+                            "advisor_name": data.get("advisor", "PGS.TS Nguyễn Văn A")
+                        },
+                        "thought": "Đã tra cứu được cố vấn; tiếp tục gọi schedule_appointment để hoàn tất yêu cầu."
+                    }
+
+                return {
+                    "type": "text",
+                    "content": (
+                        f"Kết quả tra cứu cho sinh viên {observation.get('student_id', '')} "
+                        f"({data.get('full_name', '')}): Lớp {data.get('class', '')}, "
+                        f"GPA: {data.get('gpa', '')}, Email: {data.get('email', '')}, "
+                        f"Trạng thái: {data.get('status', '')}, Cố vấn: {data.get('advisor', '')}."
+                    ),
+                    "thought": "Đã có đủ dữ liệu học vụ để tổng hợp câu trả lời cuối cùng."
+                }
+
+            if "message" in observation:
+                return {
+                    "type": "text",
+                    "content": observation["message"],
+                    "thought": "Hành động đã hoàn tất; tôi trả lại thông báo xác nhận từ công cụ."
+                }
+
             return {
-                "type": "tool_call",
-                "tool_name": "schedule_appointment",
-                "arguments": {"student_id": "SV2026001", "datetime_str": "14:00 15/09/2026", "advisor_name": "PGS.TS Nguyễn Văn A"},
-                "thought": "Người dùng yêu cầu đặt lịch hẹn tư vấn cho sinh viên SV2026001. Tôi sẽ gọi tool schedule_appointment."
+                "type": "text",
+                "content": f"Phản hồi từ công cụ: {json.dumps(observation, ensure_ascii=False)}",
+                "thought": "Tổng hợp phản hồi cuối cùng từ Observation."
             }
-        elif "sv2026001" in prompt_lower or "tra cứu" in prompt_lower:
+
+        # Nhận diện yêu cầu nhiều bước trước khi xử lý yêu cầu một Tool.
+        is_multi_step = "đặt lịch" in prompt_lower and (
+            "tra cứu" in prompt_lower or "cố vấn học tập" in prompt_lower
+        )
+        if is_multi_step and student_id:
             return {
                 "type": "tool_call",
                 "tool_name": "academic_query",
-                "arguments": {"student_id": "SV2026001"},
-                "thought": "Người dùng muốn tra cứu thông tin học vụ của sinh viên SV2026001. Tôi sẽ gọi tool academic_query."
+                "arguments": {"student_id": student_id},
+                "thought": "Cần biết cố vấn phụ trách trước khi đặt lịch; tôi tra cứu hồ sơ sinh viên trước."
             }
-        else:
+
+        if student_id and "đặt lịch" in prompt_lower:
+            advisor_name = "TS. Lê Thị B" if "TS. Lê Thị B" in prompt else "PGS.TS Nguyễn Văn A"
             return {
-                "type": "text",
-                "content": f"[Mock Agent Response]: Xin chào! Quy chế học vụ VinUni yêu cầu sinh viên tích lũy tối thiểu 120 tín chỉ và duy trì GPA trên 2.0 để tốt nghiệp.",
-                "thought": "Câu hỏi chung về quy chế học vụ, trả lời trực tiếp không cần gọi Tool."
+                "type": "tool_call",
+                "tool_name": "schedule_appointment",
+                "arguments": {
+                    "student_id": student_id,
+                    "datetime_str": datetime_str,
+                    "advisor_name": advisor_name
+                },
+                "thought": f"Người dùng yêu cầu đặt lịch cho {student_id}; tôi gọi schedule_appointment."
             }
+
+        if student_id and "tra cứu" in prompt_lower:
+            return {
+                "type": "tool_call",
+                "tool_name": "academic_query",
+                "arguments": {"student_id": student_id},
+                "thought": f"Người dùng muốn tra cứu thông tin của {student_id}; tôi gọi academic_query."
+            }
+
+        return {
+            "type": "text",
+            "content": "[Mock Agent Response]: Xin chào! Quy chế học vụ VinUni yêu cầu sinh viên tích lũy tối thiểu 120 tín chỉ và duy trì GPA trên 2.0 để tốt nghiệp.",
+            "thought": "Câu hỏi chung về quy chế học vụ, trả lời trực tiếp không cần gọi Tool."
+        }
 
 
 class GeminiProvider(BaseLLMProvider):
     """Google Gemini Provider (Native Tool Calling với Google GenAI SDK)"""
     def __init__(self, api_key: str = None, model: str = None):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
-        self.model_name = model or os.getenv("LLM_MODEL") or "gemini-2.5-flash"
+        self.model_name = model or os.getenv("LLM_MODEL") or "gemini-3.6-flash"
+        try:
+            self.min_request_interval = float(
+                os.getenv("GEMINI_MIN_REQUEST_INTERVAL_SECONDS", "13")
+            )
+        except ValueError:
+            self.min_request_interval = 13.0
+        self._last_request_at = 0.0
+
+    def _respect_rate_limit(self):
+        """Giãn cách request để không vượt quota Gemini Free Tier theo phút."""
+        elapsed = time.monotonic() - self._last_request_at
+        wait_seconds = self.min_request_interval - elapsed
+        if self._last_request_at and wait_seconds > 0:
+            print(f"⏳ [Gemini Free Tier]: Chờ {wait_seconds:.1f}s trước request tiếp theo...")
+            time.sleep(wait_seconds)
+        self._last_request_at = time.monotonic()
 
     def generate(self, prompt: str, system_prompt: str = "") -> str:
         if not self.api_key or self.api_key == "your_gemini_api_key_here":
@@ -107,6 +211,7 @@ class GeminiProvider(BaseLLMProvider):
                 temperature=0.2
             )
 
+            self._respect_rate_limit()
             response = client.models.generate_content(
                 model=self.model_name,
                 contents=prompt,
